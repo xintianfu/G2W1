@@ -6,8 +6,14 @@ const logEl = document.getElementById('log');
 let renderer, scene, camera;
 let latestSnapshot = null;
 let pendingSnapshot = false;
-let lastPinchTime = 0;
-const PINCH_COOLDOWN_MS = 1200;
+
+const pinchState = {
+  left: false,
+  right: false,
+};
+
+const PINCH_THRESHOLD_METERS = 0.025;   // 2.5 cm
+const RELEASE_THRESHOLD_METERS = 0.04;  // 4 cm
 
 function log(...args) {
   const msg = args.join(' ');
@@ -84,17 +90,6 @@ function downloadJSON(obj, filename = 'snapshot-depth.json') {
   URL.revokeObjectURL(url);
 }
 
-function requestSnapshot(reason = 'manual') {
-  const now = Date.now();
-  if (now - lastPinchTime < PINCH_COOLDOWN_MS) {
-    log('Pinch ignored: cooldown active.');
-    return;
-  }
-  lastPinchTime = now;
-  pendingSnapshot = true;
-  log('Snapshot requested by', reason);
-}
-
 function initThree() {
   scene = new THREE.Scene();
   camera = new THREE.PerspectiveCamera();
@@ -112,6 +107,45 @@ function initThree() {
   window.addEventListener('resize', () => {
     renderer.setSize(window.innerWidth, window.innerHeight);
   });
+}
+
+function getJointPose(frame, hand, jointName, refSpace) {
+  const jointSpace = hand.get(jointName);
+  if (!jointSpace) return null;
+  return frame.getJointPose(jointSpace, refSpace);
+}
+
+function distance3D(a, b) {
+  const dx = a.transform.position.x - b.transform.position.x;
+  const dy = a.transform.position.y - b.transform.position.y;
+  const dz = a.transform.position.z - b.transform.position.z;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function updateHandPinch(frame, refSpace, inputSource) {
+  if (!inputSource?.hand) return;
+
+  const handedness = inputSource.handedness || 'unknown';
+  const hand = inputSource.hand;
+
+  const thumbTip = getJointPose(frame, hand, 'thumb-tip', refSpace);
+  const indexTip = getJointPose(frame, hand, 'index-finger-tip', refSpace);
+
+  if (!thumbTip || !indexTip) return;
+
+  const d = distance3D(thumbTip, indexTip);
+
+  // pinch down
+  if (!pinchState[handedness] && d < PINCH_THRESHOLD_METERS) {
+    pinchState[handedness] = true;
+    pendingSnapshot = true;
+    log(`Pinch detected: ${handedness}, distance=${d.toFixed(4)}m`);
+  }
+
+  // pinch release
+  if (pinchState[handedness] && d > RELEASE_THRESHOLD_METERS) {
+    pinchState[handedness] = false;
+  }
 }
 
 async function enterAR() {
@@ -135,23 +169,35 @@ async function enterAR() {
     },
   });
 
-  session.addEventListener('select', (event) => {
-    if (event.inputSource?.hand) {
-      requestSnapshot(`pinch-${event.inputSource.handedness || 'unknown'}`);
-    }
-  });
-
   await renderer.xr.setSession(session);
 
-  log('AR session started. Use pinch.');
+  session.addEventListener('inputsourceschange', () => {
+    const summary = session.inputSources.map((s) => {
+      const kind = s.hand ? 'hand' : 'other';
+      return `${kind}:${s.handedness || 'unknown'}`;
+    });
+    log('inputSources:', summary.join(', '));
+  });
+
+  log('AR session started.');
+  log('Use thumb + index pinch to capture.');
 
   renderer.setAnimationLoop((time, frame) => {
     renderer.render(scene, camera);
 
-    if (!frame || !pendingSnapshot) return;
-    pendingSnapshot = false;
+    if (!frame) return;
 
     const refSpace = renderer.xr.getReferenceSpace();
+    const session = frame.session;
+
+    // 每帧自己检测 pinch
+    for (const inputSource of session.inputSources) {
+      updateHandPinch(frame, refSpace, inputSource);
+    }
+
+    if (!pendingSnapshot) return;
+    pendingSnapshot = false;
+
     const pose = frame.getViewerPose(refSpace);
     if (!pose || !pose.views.length) {
       log('No viewer pose.');
