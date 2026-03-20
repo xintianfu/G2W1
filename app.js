@@ -148,7 +148,7 @@ function onXRFrame(time, frame) {
   session.requestAnimationFrame(onXRFrame);
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, session.renderState.baseLayer.framebuffer);
-  gl.clearColor(0.08, 0.08, 0.10, 1.0);
+  gl.clearColor(0.0, 0.0, 0.0, 0.0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
   if (!pose) return;
