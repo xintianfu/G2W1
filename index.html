@@ -3,19 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Quest 3 WebXR Snapshot + Depth JSON Test</title>
+  <title>Quest 3 Pinch Snapshot Test</title>
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
-  <div id="xr-overlay">
-    <div id="ui">
-      <button id="enter-ar">Enter AR</button>
-      <button id="take-snapshot" disabled>Take Snapshot</button>
-      <button id="download-json" disabled>Download JSON</button>
-    </div>
-
-    <div id="log">Ready.</div>
+  <div id="ui">
+    <button id="enter-ar">Enter AR</button>
   </div>
+
+  <div id="log">Ready. After entering AR, use pinch to capture a snapshot.</div>
 
   <canvas id="xr-canvas"></canvas>
 

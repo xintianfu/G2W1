@@ -1,15 +1,15 @@
 const canvas = document.getElementById("xr-canvas");
-const overlayRoot = document.getElementById("xr-overlay");
 const logEl = document.getElementById("log");
 const enterArBtn = document.getElementById("enter-ar");
-const snapshotBtn = document.getElementById("take-snapshot");
-const downloadBtn = document.getElementById("download-json");
 
 let gl = null;
 let xrSession = null;
 let xrRefSpace = null;
+
 let pendingSnapshot = false;
 let latestSnapshot = null;
+let lastPinchTime = 0;
+const PINCH_COOLDOWN_MS = 1200;
 
 function log(...args) {
   const msg = args.map(String).join(" ");
@@ -89,6 +89,22 @@ function downloadJSON(obj, filename = "snapshot-depth.json") {
   URL.revokeObjectURL(url);
 }
 
+function requestSnapshot(reason = "manual") {
+  const now = Date.now();
+  if (now - lastPinchTime < PINCH_COOLDOWN_MS) {
+    log("Pinch ignored: cooldown active.");
+    return;
+  }
+
+  lastPinchTime = now;
+  pendingSnapshot = true;
+  log("Snapshot requested by", reason);
+}
+
+function isHandInputSource(inputSource) {
+  return inputSource && inputSource.hand;
+}
+
 async function initAR() {
   if (!navigator.xr) {
     log("navigator.xr not available.");
@@ -112,23 +128,29 @@ async function initAR() {
     return;
   }
 
-  const sessionInit = {
+  xrSession = await navigator.xr.requestSession("immersive-ar", {
     requiredFeatures: ["local", "depth-sensing"],
-    optionalFeatures: ["hand-tracking", "dom-overlay"],
-    domOverlay: { root: overlayRoot },
+    optionalFeatures: ["hand-tracking"],
     depthSensing: {
       usagePreference: ["cpu-optimized"],
       dataFormatPreference: ["float32", "luminance-alpha"],
     },
-  };
-
-  xrSession = await navigator.xr.requestSession("immersive-ar", sessionInit);
+  });
 
   xrSession.addEventListener("end", () => {
     log("XR session ended.");
     xrSession = null;
     xrRefSpace = null;
-    snapshotBtn.disabled = true;
+  });
+
+  // pinch/select 触发 snapshot
+  xrSession.addEventListener("select", (event) => {
+    if (isHandInputSource(event.inputSource)) {
+      const handedness = event.inputSource.handedness || "unknown-hand";
+      requestSnapshot(`pinch-${handedness}`);
+    } else {
+      requestSnapshot("select-non-hand");
+    }
   });
 
   await gl.makeXRCompatible();
@@ -138,17 +160,10 @@ async function initAR() {
   });
 
   xrSession.updateRenderState({ baseLayer });
-
   xrRefSpace = await xrSession.requestReferenceSpace("local");
 
-  snapshotBtn.disabled = false;
-
-  const overlayType = xrSession.domOverlayState
-    ? xrSession.domOverlayState.type
-    : "null";
-
   log("AR session started.");
-  log("domOverlayState:", overlayType);
+  log("Use pinch to capture a snapshot.");
 
   xrSession.requestAnimationFrame(onXRFrame);
 }
@@ -163,7 +178,7 @@ function onXRFrame(time, frame) {
   const baseLayer = session.renderState.baseLayer;
   gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
 
-  // 透明背景，避免黑屏挡住 passthrough
+  // 透明背景，显示真实世界 passthrough
   gl.clearColor(0.0, 0.0, 0.0, 0.0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
@@ -220,7 +235,8 @@ function onXRFrame(time, frame) {
       log("Snapshot captured, but no depth info returned.");
     }
 
-    downloadBtn.disabled = false;
+    downloadJSON(latestSnapshot, "snapshot-depth.json");
+    log("snapshot-depth.json download triggered.");
   }
 }
 
@@ -230,24 +246,4 @@ enterArBtn.addEventListener("click", async () => {
   } catch (err) {
     log("Failed to start AR:", err.message);
   }
-});
-
-snapshotBtn.addEventListener("click", () => {
-  if (!xrSession) {
-    log("No XR session.");
-    return;
-  }
-
-  pendingSnapshot = true;
-  log("Snapshot requested. Will capture on next XR frame.");
-});
-
-downloadBtn.addEventListener("click", () => {
-  if (!latestSnapshot) {
-    log("No snapshot data yet.");
-    return;
-  }
-
-  downloadJSON(latestSnapshot, "snapshot-depth.json");
-  log("JSON downloaded.");
 });

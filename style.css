@@ -12,21 +12,11 @@ body {
   height: 100vh;
 }
 
-#xr-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 10;
-  pointer-events: none;
-}
-
 #ui {
   position: fixed;
   top: 12px;
   left: 12px;
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  pointer-events: auto;
+  z-index: 10;
 }
 
 button {
@@ -37,11 +27,6 @@ button {
   border-radius: 8px;
   background: rgba(30, 30, 30, 0.9);
   color: white;
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 
 #log {
@@ -57,5 +42,5 @@ button:disabled {
   font-size: 12px;
   border: 1px solid #444;
   border-radius: 8px;
-  pointer-events: auto;
+  z-index: 10;
 }
