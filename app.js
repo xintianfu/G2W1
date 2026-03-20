@@ -1,4 +1,5 @@
 const canvas = document.getElementById("xr-canvas");
+const overlayRoot = document.getElementById("xr-overlay");
 const logEl = document.getElementById("log");
 const enterArBtn = document.getElementById("enter-ar");
 const snapshotBtn = document.getElementById("take-snapshot");
@@ -79,13 +80,12 @@ function downloadJSON(obj, filename = "snapshot-depth.json") {
     [JSON.stringify(obj, null, 2)],
     { type: "application/json" }
   );
-  const url = URL.createObjectURL(blob);
 
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
   a.click();
-
   URL.revokeObjectURL(url);
 }
 
@@ -112,14 +112,17 @@ async function initAR() {
     return;
   }
 
-  xrSession = await navigator.xr.requestSession("immersive-ar", {
+  const sessionInit = {
     requiredFeatures: ["local", "depth-sensing"],
-    optionalFeatures: ["hand-tracking"],
+    optionalFeatures: ["hand-tracking", "dom-overlay"],
+    domOverlay: { root: overlayRoot },
     depthSensing: {
       usagePreference: ["cpu-optimized"],
       dataFormatPreference: ["float32", "luminance-alpha"],
     },
-  });
+  };
+
+  xrSession = await navigator.xr.requestSession("immersive-ar", sessionInit);
 
   xrSession.addEventListener("end", () => {
     log("XR session ended.");
@@ -130,28 +133,39 @@ async function initAR() {
 
   await gl.makeXRCompatible();
 
-  const baseLayer = new XRWebGLLayer(xrSession, gl);
+  const baseLayer = new XRWebGLLayer(xrSession, gl, {
+    alpha: true,
+  });
+
   xrSession.updateRenderState({ baseLayer });
 
   xrRefSpace = await xrSession.requestReferenceSpace("local");
 
   snapshotBtn.disabled = false;
+
+  const overlayType = xrSession.domOverlayState
+    ? xrSession.domOverlayState.type
+    : "null";
+
   log("AR session started.");
+  log("domOverlayState:", overlayType);
 
   xrSession.requestAnimationFrame(onXRFrame);
 }
 
 function onXRFrame(time, frame) {
   const session = frame.session;
-  const pose = frame.getViewerPose(xrRefSpace);
-
   session.requestAnimationFrame(onXRFrame);
 
-  gl.bindFramebuffer(gl.FRAMEBUFFER, session.renderState.baseLayer.framebuffer);
+  const pose = frame.getViewerPose(xrRefSpace);
+  if (!pose) return;
+
+  const baseLayer = session.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
+
+  // 透明背景，避免黑屏挡住 passthrough
   gl.clearColor(0.0, 0.0, 0.0, 0.0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
-  if (!pose) return;
 
   const view = pose.views[0];
   if (!view) return;
@@ -166,6 +180,15 @@ function onXRFrame(time, frame) {
       log("getDepthInformation failed:", err.message);
     }
 
+    let centerDepth = null;
+    if (depthInfo) {
+      try {
+        centerDepth = depthInfo.getDepthInMeters(0.5, 0.5);
+      } catch (err) {
+        log("center depth read failed:", err.message);
+      }
+    }
+
     latestSnapshot = {
       timestamp: new Date().toISOString(),
       sessionMode: session.mode,
@@ -174,20 +197,24 @@ function onXRFrame(time, frame) {
         transform: poseToJSON(view.transform),
         projectionMatrix: flattenMatrix(view.projectionMatrix),
       },
+      centerDepthMeters: sanitizeNumber(centerDepth),
       depth: depthInfo ? serializeDepthMap(depthInfo, 8) : null,
       notes: [
-        "depth.samplesMeters 是降采样后的深度，单位米",
-        "这不是 object-level segmentation，只是 depth map",
-        "要区分不同 object，后面还需要 segmentation 或 region annotation",
+        "depth.samplesMeters is a sampled depth map in meters",
+        "this is not object segmentation",
+        "to isolate objects, you still need region annotation or segmentation",
       ],
     };
 
     if (latestSnapshot.depth) {
       log(
-        "Snapshot captured. Depth size:",
-        latestSnapshot.depth.width + "x" + latestSnapshot.depth.height,
+        "Snapshot captured.",
+        "Depth size:",
+        `${latestSnapshot.depth.width}x${latestSnapshot.depth.height}`,
         "sampleStep:",
-        latestSnapshot.depth.sampleStep
+        latestSnapshot.depth.sampleStep,
+        "centerDepth:",
+        latestSnapshot.centerDepthMeters
       );
     } else {
       log("Snapshot captured, but no depth info returned.");
