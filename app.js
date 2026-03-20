@@ -1,25 +1,27 @@
-const canvas = document.getElementById("xr-canvas");
-const logEl = document.getElementById("log");
-const enterArBtn = document.getElementById("enter-ar");
+import * as THREE from 'https://unpkg.com/three@0.179.1/build/three.module.js';
 
-let gl = null;
-let xrSession = null;
-let xrRefSpace = null;
+const enterBtn = document.getElementById('enter-ar');
+const logEl = document.getElementById('log');
 
-let pendingSnapshot = false;
+let renderer, scene, camera;
 let latestSnapshot = null;
+let pendingSnapshot = false;
 let lastPinchTime = 0;
 const PINCH_COOLDOWN_MS = 1200;
 
 function log(...args) {
-  const msg = args.map(String).join(" ");
+  const msg = args.join(' ');
   console.log(msg);
-  logEl.textContent += "\n" + msg;
+  logEl.textContent += '\n' + msg;
   logEl.scrollTop = logEl.scrollHeight;
 }
 
 function flattenMatrix(mat) {
   return Array.from(mat);
+}
+
+function sanitizeNumber(v) {
+  return Number.isFinite(v) ? v : null;
 }
 
 function poseToJSON(xrRigidTransform) {
@@ -41,22 +43,17 @@ function poseToJSON(xrRigidTransform) {
   };
 }
 
-function sanitizeNumber(v) {
-  return Number.isFinite(v) ? v : null;
-}
-
 function serializeDepthMap(depthInfo, sampleStep = 8) {
   const width = depthInfo.width;
   const height = depthInfo.height;
-
   const samples = [];
+
   for (let py = 0; py < height; py += sampleStep) {
     const row = [];
     for (let px = 0; px < width; px += sampleStep) {
       const nx = width > 1 ? px / (width - 1) : 0;
       const ny = height > 1 ? py / (height - 1) : 0;
-      const d = depthInfo.getDepthInMeters(nx, ny);
-      row.push(sanitizeNumber(d));
+      row.push(sanitizeNumber(depthInfo.getDepthInMeters(nx, ny)));
     }
     samples.push(row);
   }
@@ -65,7 +62,7 @@ function serializeDepthMap(depthInfo, sampleStep = 8) {
     width,
     height,
     sampleStep,
-    sampledWidth: samples[0] ? samples[0].length : 0,
+    sampledWidth: samples[0]?.length ?? 0,
     sampledHeight: samples.length,
     rawValueToMeters: depthInfo.rawValueToMeters ?? null,
     normDepthBufferFromNormView: depthInfo.normDepthBufferFromNormView
@@ -75,124 +72,99 @@ function serializeDepthMap(depthInfo, sampleStep = 8) {
   };
 }
 
-function downloadJSON(obj, filename = "snapshot-depth.json") {
-  const blob = new Blob(
-    [JSON.stringify(obj, null, 2)],
-    { type: "application/json" }
-  );
-
+function downloadJSON(obj, filename = 'snapshot-depth.json') {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], {
+    type: 'application/json',
+  });
   const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
+  const a = document.createElement('a');
   a.href = url;
   a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
 }
 
-function requestSnapshot(reason = "manual") {
+function requestSnapshot(reason = 'manual') {
   const now = Date.now();
   if (now - lastPinchTime < PINCH_COOLDOWN_MS) {
-    log("Pinch ignored: cooldown active.");
+    log('Pinch ignored: cooldown active.');
     return;
   }
-
   lastPinchTime = now;
   pendingSnapshot = true;
-  log("Snapshot requested by", reason);
+  log('Snapshot requested by', reason);
 }
 
-function isHandInputSource(inputSource) {
-  return inputSource && inputSource.hand;
-}
+function initThree() {
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera();
 
-async function initAR() {
-  if (!navigator.xr) {
-    log("navigator.xr not available.");
-    return;
-  }
-
-  const supported = await navigator.xr.isSessionSupported("immersive-ar");
-  if (!supported) {
-    log("immersive-ar not supported on this browser/device.");
-    return;
-  }
-
-  gl = canvas.getContext("webgl2", {
-    xrCompatible: true,
+  renderer = new THREE.WebGLRenderer({
     alpha: true,
     antialias: true,
   });
 
-  if (!gl) {
-    log("WebGL2 not available.");
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+
+  document.body.appendChild(renderer.domElement);
+
+  window.addEventListener('resize', () => {
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+}
+
+async function enterAR() {
+  if (!navigator.xr) {
+    log('navigator.xr not available.');
     return;
   }
 
-  xrSession = await navigator.xr.requestSession("immersive-ar", {
-    requiredFeatures: ["local", "depth-sensing"],
-    optionalFeatures: ["hand-tracking"],
+  const supported = await navigator.xr.isSessionSupported('immersive-ar');
+  if (!supported) {
+    log('immersive-ar not supported.');
+    return;
+  }
+
+  const session = await navigator.xr.requestSession('immersive-ar', {
+    requiredFeatures: ['local', 'depth-sensing'],
+    optionalFeatures: ['hand-tracking'],
     depthSensing: {
-      usagePreference: ["cpu-optimized"],
-      dataFormatPreference: ["float32", "luminance-alpha"],
+      usagePreference: ['cpu-optimized'],
+      dataFormatPreference: ['float32', 'luminance-alpha'],
     },
   });
 
-  xrSession.addEventListener("end", () => {
-    log("XR session ended.");
-    xrSession = null;
-    xrRefSpace = null;
-  });
-
-  // pinch/select 触发 snapshot
-  xrSession.addEventListener("select", (event) => {
-    if (isHandInputSource(event.inputSource)) {
-      const handedness = event.inputSource.handedness || "unknown-hand";
-      requestSnapshot(`pinch-${handedness}`);
-    } else {
-      requestSnapshot("select-non-hand");
+  session.addEventListener('select', (event) => {
+    if (event.inputSource?.hand) {
+      requestSnapshot(`pinch-${event.inputSource.handedness || 'unknown'}`);
     }
   });
 
-  await gl.makeXRCompatible();
+  await renderer.xr.setSession(session);
 
-  const baseLayer = new XRWebGLLayer(xrSession, gl, {
-    alpha: true,
-  });
+  log('AR session started. Use pinch.');
 
-  xrSession.updateRenderState({ baseLayer });
-  xrRefSpace = await xrSession.requestReferenceSpace("local");
+  renderer.setAnimationLoop((time, frame) => {
+    renderer.render(scene, camera);
 
-  log("AR session started.");
-  log("Use pinch to capture a snapshot.");
-
-  xrSession.requestAnimationFrame(onXRFrame);
-}
-
-function onXRFrame(time, frame) {
-  const session = frame.session;
-  session.requestAnimationFrame(onXRFrame);
-
-  const pose = frame.getViewerPose(xrRefSpace);
-  if (!pose) return;
-
-  const baseLayer = session.renderState.baseLayer;
-  gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
-
-  // 透明背景，显示真实世界 passthrough
-  gl.clearColor(0.0, 0.0, 0.0, 0.0);
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
-  const view = pose.views[0];
-  if (!view) return;
-
-  if (pendingSnapshot) {
+    if (!frame || !pendingSnapshot) return;
     pendingSnapshot = false;
+
+    const refSpace = renderer.xr.getReferenceSpace();
+    const pose = frame.getViewerPose(refSpace);
+    if (!pose || !pose.views.length) {
+      log('No viewer pose.');
+      return;
+    }
+
+    const view = pose.views[0];
 
     let depthInfo = null;
     try {
       depthInfo = frame.getDepthInformation(view);
     } catch (err) {
-      log("getDepthInformation failed:", err.message);
+      log('getDepthInformation failed:', err.message);
     }
 
     let centerDepth = null;
@@ -200,50 +172,31 @@ function onXRFrame(time, frame) {
       try {
         centerDepth = depthInfo.getDepthInMeters(0.5, 0.5);
       } catch (err) {
-        log("center depth read failed:", err.message);
+        log('center depth read failed:', err.message);
       }
     }
 
     latestSnapshot = {
       timestamp: new Date().toISOString(),
       sessionMode: session.mode,
-      referenceSpaceType: "local",
+      referenceSpaceType: 'local',
       camera: {
         transform: poseToJSON(view.transform),
         projectionMatrix: flattenMatrix(view.projectionMatrix),
       },
       centerDepthMeters: sanitizeNumber(centerDepth),
       depth: depthInfo ? serializeDepthMap(depthInfo, 8) : null,
-      notes: [
-        "depth.samplesMeters is a sampled depth map in meters",
-        "this is not object segmentation",
-        "to isolate objects, you still need region annotation or segmentation",
-      ],
     };
 
-    if (latestSnapshot.depth) {
-      log(
-        "Snapshot captured.",
-        "Depth size:",
-        `${latestSnapshot.depth.width}x${latestSnapshot.depth.height}`,
-        "sampleStep:",
-        latestSnapshot.depth.sampleStep,
-        "centerDepth:",
-        latestSnapshot.centerDepthMeters
-      );
-    } else {
-      log("Snapshot captured, but no depth info returned.");
-    }
+    log(
+      'Snapshot captured.',
+      'centerDepth:',
+      String(latestSnapshot.centerDepthMeters)
+    );
 
-    downloadJSON(latestSnapshot, "snapshot-depth.json");
-    log("snapshot-depth.json download triggered.");
-  }
+    downloadJSON(latestSnapshot);
+  });
 }
 
-enterArBtn.addEventListener("click", async () => {
-  try {
-    await initAR();
-  } catch (err) {
-    log("Failed to start AR:", err.message);
-  }
-});
+initThree();
+enterBtn.addEventListener('click', enterAR);
