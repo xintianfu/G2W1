@@ -5,28 +5,31 @@ const enterArBtn = document.getElementById("enter-ar");
 let gl = null;
 let xrSession = null;
 let xrRefSpace = null;
-let glBinding = null;
+let xrGlBinding = null;
 
 let pendingSnapshot = false;
+let latestSnapshot = null;
 let lastPinchTime = 0;
 const PINCH_COOLDOWN_MS = 1200;
 
-let debugLogs = [];
+// ===== depth sampling config =====
+const CENTER_WINDOW_SIZE = 9;   // 中心区域 9x9
+const GRID_ROWS = 3;            // 3x3 区域
+const GRID_COLS = 3;
+const GRID_CELL_SIZE = 9;       // 每个区域窗口 9x9
+const GRID_SPACING = 18;        // 区域中心之间的像素间隔
 
-// preview
-let previewProgram = null;
-let previewVbo = null;
-
-// readback
-let readProgram = null;
-let readFbo = null;
-let readColorTex = null;
-const READ_SIZE = 1;
+// ===== GPU debug readback resources =====
+let debugProgram = null;
+let debugVAO = null;
+let debugColorTex = null;
+let debugFbo = null;
+let debugDepthWidth = 0;
+let debugDepthHeight = 0;
 
 function log(...args) {
   const msg = args.map(String).join(" ");
   console.log(msg);
-  debugLogs.push(msg);
   logEl.textContent += "\n" + msg;
   logEl.scrollTop = logEl.scrollHeight;
 }
@@ -58,24 +61,13 @@ function sanitizeNumber(v) {
   return Number.isFinite(v) ? v : null;
 }
 
-function downloadJSON(obj, filename = "snapshot-depth.json") {
-  const blob = new Blob([JSON.stringify(obj, null, 2)], {
-    type: "application/json",
-  });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
 function requestSnapshot(reason = "manual") {
   const now = Date.now();
   if (now - lastPinchTime < PINCH_COOLDOWN_MS) {
     log("Pinch ignored: cooldown active.");
     return;
   }
+
   lastPinchTime = now;
   pendingSnapshot = true;
   log("Snapshot requested by", reason);
@@ -85,253 +77,287 @@ function isHandInputSource(inputSource) {
   return inputSource && inputSource.hand;
 }
 
-function compileShader(gl, type, source) {
-  const s = gl.createShader(type);
-  gl.shaderSource(s, source);
-  gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    const info = gl.getShaderInfoLog(s);
-    gl.deleteShader(s);
+function createShader(gl, type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    const info = gl.getShaderInfoLog(shader);
+    gl.deleteShader(shader);
     throw new Error("Shader compile failed: " + info);
   }
-  return s;
+
+  return shader;
 }
 
 function createProgram(gl, vsSource, fsSource) {
-  const vs = compileShader(gl, gl.VERTEX_SHADER, vsSource);
-  const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
-  const p = gl.createProgram();
-  gl.attachShader(p, vs);
-  gl.attachShader(p, fs);
-  gl.linkProgram(p);
+  const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
+  const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    const info = gl.getProgramInfoLog(program);
+    gl.deleteProgram(program);
+    throw new Error("Program link failed: " + info);
+  }
 
   gl.deleteShader(vs);
   gl.deleteShader(fs);
+  return program;
+}
 
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
-    const info = gl.getProgramInfoLog(p);
-    gl.deleteProgram(p);
-    throw new Error("Program link failed: " + info);
+function initDebugDrawResources() {
+  // 一个最简单的 fullscreen triangle
+  const vsSource = `#version 300 es
+    const vec2 POS[3] = vec2[](
+      vec2(-1.0, -1.0),
+      vec2( 3.0, -1.0),
+      vec2(-1.0,  3.0)
+    );
+    out vec2 vUv;
+    void main() {
+      vec2 pos = POS[gl_VertexID];
+      vUv = pos * 0.5 + 0.5;
+      gl_Position = vec4(pos, 0.0, 1.0);
+    }
+  `;
+
+  // 同时支持 texture-2d 和 texture-array，两者只用一个
+  const fsSource = `#version 300 es
+    precision highp float;
+    precision highp sampler2D;
+    precision highp sampler2DArray;
+
+    in vec2 vUv;
+    out vec4 outColor;
+
+    uniform sampler2D uTex2D;
+    uniform sampler2DArray uTexArray;
+    uniform int uTextureType;   // 0 = 2D, 1 = array
+    uniform int uImageIndex;
+
+    void main() {
+      float d = 0.0;
+
+      if (uTextureType == 0) {
+        d = texture(uTex2D, vUv).r;
+      } else {
+        d = texture(uTexArray, vec3(vUv, float(uImageIndex))).r;
+      }
+
+      outColor = vec4(d, d, d, 1.0);
+    }
+  `;
+
+  debugProgram = createProgram(gl, vsSource, fsSource);
+  debugVAO = gl.createVertexArray();
+}
+
+function ensureDebugTarget(width, height) {
+  if (
+    debugColorTex &&
+    debugFbo &&
+    debugDepthWidth === width &&
+    debugDepthHeight === height
+  ) {
+    return;
   }
-  return p;
-}
 
-function initQuadBuffer() {
-  previewVbo = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, previewVbo);
-  gl.bufferData(
-    gl.ARRAY_BUFFER,
-    new Float32Array([
-      -1, -1,
-       1, -1,
-      -1,  1,
-      -1,  1,
-       1, -1,
-       1,  1,
-    ]),
-    gl.STATIC_DRAW
-  );
-  gl.bindBuffer(gl.ARRAY_BUFFER, null);
-}
+  if (debugColorTex) gl.deleteTexture(debugColorTex);
+  if (debugFbo) gl.deleteFramebuffer(debugFbo);
 
-function initPreviewPipeline() {
-  const vs = `#version 300 es
-    in vec2 a_pos;
-    out vec2 v_uv;
-    void main() {
-      v_uv = a_pos * 0.5 + 0.5;
-      gl_Position = vec4(a_pos, 0.0, 1.0);
-    }
-  `;
+  debugDepthWidth = width;
+  debugDepthHeight = height;
 
-  const fs = `#version 300 es
-    precision highp float;
-    precision highp sampler2DArray;
-
-    in vec2 v_uv;
-    out vec4 outColor;
-
-    uniform sampler2DArray u_depthTex;
-    uniform mat4 u_uvTransform;
-    uniform float u_imageIndex;
-    uniform float u_opacity;
-
-    vec2 transformUV(vec2 uv) {
-      vec4 t = u_uvTransform * vec4(uv, 0.0, 1.0);
-      return t.xy;
-    }
-
-    void main() {
-      vec2 duv = transformUV(v_uv);
-      vec4 texel = texture(u_depthTex, vec3(duv, u_imageIndex));
-
-      float depthVis = texel.r;
-      float gray = 1.0 - clamp(depthVis, 0.0, 1.0);
-
-      outColor = vec4(vec3(gray), u_opacity);
-    }
-  `;
-
-  previewProgram = createProgram(gl, vs, fs);
-}
-
-function initReadbackPipeline() {
-  const vs = `#version 300 es
-    in vec2 a_pos;
-    out vec2 v_uv;
-    void main() {
-      v_uv = a_pos * 0.5 + 0.5;
-      gl_Position = vec4(a_pos, 0.0, 1.0);
-    }
-  `;
-
-  // 把 depth texture 的采样值直接写到 RGBA 颜色里，方便 readPixels
-  const fs = `#version 300 es
-    precision highp float;
-    precision highp sampler2DArray;
-
-    in vec2 v_uv;
-    out vec4 outColor;
-
-    uniform sampler2DArray u_depthTex;
-    uniform mat4 u_uvTransform;
-    uniform float u_imageIndex;
-
-    vec2 transformUV(vec2 uv) {
-      vec4 t = u_uvTransform * vec4(uv, 0.0, 1.0);
-      return t.xy;
-    }
-
-    void main() {
-      vec2 duv = transformUV(v_uv);
-      vec4 texel = texture(u_depthTex, vec3(duv, u_imageIndex));
-
-      // 这里只先读 red 通道
-      float v = texel.r;
-      outColor = vec4(v, v, v, 1.0);
-    }
-  `;
-
-  readProgram = createProgram(gl, vs, fs);
-
-  readFbo = gl.createFramebuffer();
-  readColorTex = gl.createTexture();
-
-  gl.bindTexture(gl.TEXTURE_2D, readColorTex);
+  debugColorTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, debugColorTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   gl.texImage2D(
     gl.TEXTURE_2D,
     0,
     gl.RGBA8,
-    READ_SIZE,
-    READ_SIZE,
+    width,
+    height,
     0,
     gl.RGBA,
     gl.UNSIGNED_BYTE,
     null
   );
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-  gl.bindFramebuffer(gl.FRAMEBUFFER, readFbo);
+  debugFbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, debugFbo);
   gl.framebufferTexture2D(
     gl.FRAMEBUFFER,
     gl.COLOR_ATTACHMENT0,
     gl.TEXTURE_2D,
-    readColorTex,
+    debugColorTex,
     0
   );
 
   const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
   if (status !== gl.FRAMEBUFFER_COMPLETE) {
-    throw new Error("Readback framebuffer incomplete: " + status);
+    throw new Error("Debug framebuffer incomplete: " + status);
   }
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.bindTexture(gl.TEXTURE_2D, null);
 }
 
-function drawGpuDepthPreview(depthInfo, viewport) {
-  gl.useProgram(previewProgram);
+function drawDepthTextureToDebugColor(depthInfo) {
+  ensureDebugTarget(depthInfo.width, depthInfo.height);
 
-  const x = Math.floor(viewport.x + viewport.width * 0.60);
-  const y = Math.floor(viewport.y + viewport.height * 0.55);
-  const w = Math.floor(viewport.width * 0.35);
-  const h = Math.floor(viewport.height * 0.35);
-  gl.viewport(x, y, w, h);
-
+  gl.bindFramebuffer(gl.FRAMEBUFFER, debugFbo);
+  gl.viewport(0, 0, depthInfo.width, depthInfo.height);
   gl.disable(gl.DEPTH_TEST);
-  gl.enable(gl.BLEND);
-  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-  const aPos = gl.getAttribLocation(previewProgram, "a_pos");
-  const uDepthTex = gl.getUniformLocation(previewProgram, "u_depthTex");
-  const uUvTransform = gl.getUniformLocation(previewProgram, "u_uvTransform");
-  const uImageIndex = gl.getUniformLocation(previewProgram, "u_imageIndex");
-  const uOpacity = gl.getUniformLocation(previewProgram, "u_opacity");
-
-  gl.bindBuffer(gl.ARRAY_BUFFER, previewVbo);
-  gl.enableVertexAttribArray(aPos);
-  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D_ARRAY, depthInfo.texture);
-  gl.uniform1i(uDepthTex, 0);
-  gl.uniformMatrix4fv(
-    uUvTransform,
-    false,
-    depthInfo.normDepthBufferFromNormView.matrix
-  );
-  gl.uniform1f(uImageIndex, depthInfo.imageIndex ?? 0);
-  gl.uniform1f(uOpacity, 0.85);
-
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-
-  gl.disableVertexAttribArray(aPos);
-  gl.bindBuffer(gl.ARRAY_BUFFER, null);
-  gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
   gl.disable(gl.BLEND);
+
+  gl.useProgram(debugProgram);
+  gl.bindVertexArray(debugVAO);
+
+  const uTextureType = gl.getUniformLocation(debugProgram, "uTextureType");
+  const uImageIndex = gl.getUniformLocation(debugProgram, "uImageIndex");
+  const uTex2D = gl.getUniformLocation(debugProgram, "uTex2D");
+  const uTexArray = gl.getUniformLocation(debugProgram, "uTexArray");
+
+  if (depthInfo.textureType === "texture-array") {
+    gl.uniform1i(uTextureType, 1);
+    gl.uniform1i(uImageIndex, depthInfo.imageIndex ?? 0);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, depthInfo.texture);
+
+    gl.uniform1i(uTex2D, 0);
+    gl.uniform1i(uTexArray, 1);
+  } else {
+    gl.uniform1i(uTextureType, 0);
+    gl.uniform1i(uImageIndex, 0);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, depthInfo.texture);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+
+    gl.uniform1i(uTex2D, 0);
+    gl.uniform1i(uTexArray, 1);
+  }
+
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  gl.bindVertexArray(null);
+  gl.useProgram(null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-function readCenterDepthRaw(depthInfo) {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, readFbo);
-  gl.viewport(0, 0, READ_SIZE, READ_SIZE);
-
-  gl.useProgram(readProgram);
-
-  const aPos = gl.getAttribLocation(readProgram, "a_pos");
-  const uDepthTex = gl.getUniformLocation(readProgram, "u_depthTex");
-  const uUvTransform = gl.getUniformLocation(readProgram, "u_uvTransform");
-  const uImageIndex = gl.getUniformLocation(readProgram, "u_imageIndex");
-
-  gl.bindBuffer(gl.ARRAY_BUFFER, previewVbo);
-  gl.enableVertexAttribArray(aPos);
-  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D_ARRAY, depthInfo.texture);
-  gl.uniform1i(uDepthTex, 0);
-  gl.uniformMatrix4fv(
-    uUvTransform,
-    false,
-    depthInfo.normDepthBufferFromNormView.matrix
+function readDebugColorPixels() {
+  const pixels = new Uint8Array(debugDepthWidth * debugDepthHeight * 4);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, debugFbo);
+  gl.readPixels(
+    0,
+    0,
+    debugDepthWidth,
+    debugDepthHeight,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    pixels
   );
-  gl.uniform1f(uImageIndex, depthInfo.imageIndex ?? 0);
-
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-
-  const pixels = new Uint8Array(4);
-  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-
-  gl.disableVertexAttribArray(aPos);
-  gl.bindBuffer(gl.ARRAY_BUFFER, null);
-  gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return pixels;
+}
+
+function getPixelRGBA(pixels, width, x, y) {
+  const clampedX = Math.max(0, Math.min(width - 1, x));
+  const clampedY = Math.max(0, Math.min(debugDepthHeight - 1, y));
+
+  const idx = (clampedY * width + clampedX) * 4;
+  return [
+    pixels[idx],
+    pixels[idx + 1],
+    pixels[idx + 2],
+    pixels[idx + 3],
+  ];
+}
+
+function rgbaToGray01(rgba) {
+  // 这里你的 debug depth 是灰度写入，所以 rgb 相同，取 r 就够了
+  return rgba[0] / 255;
+}
+
+function computeWindowStats(pixels, width, height, centerX, centerY, windowSize) {
+  const half = Math.floor(windowSize / 2);
+  const values = [];
+
+  for (let dy = -half; dy <= half; dy++) {
+    for (let dx = -half; dx <= half; dx++) {
+      const x = Math.max(0, Math.min(width - 1, centerX + dx));
+      const y = Math.max(0, Math.min(height - 1, centerY + dy));
+      const rgba = getPixelRGBA(pixels, width, x, y);
+      values.push(rgbaToGray01(rgba));
+    }
+  }
+
+  let sum = 0;
+  let min = Infinity;
+  let max = -Infinity;
+
+  for (const v of values) {
+    sum += v;
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
 
   return {
-    rgba: Array.from(pixels),
-    gray01: pixels[0] / 255.0,
+    center: { x: centerX, y: centerY },
+    windowSize,
+    sampleCount: values.length,
+    meanGray01: sanitizeNumber(sum / values.length),
+    minGray01: sanitizeNumber(min),
+    maxGray01: sanitizeNumber(max),
+  };
+}
+
+function computeGridStats(pixels, width, height, baseX, baseY) {
+  const regions = [];
+  const rowOffset = Math.floor(GRID_ROWS / 2);
+  const colOffset = Math.floor(GRID_COLS / 2);
+
+  for (let row = 0; row < GRID_ROWS; row++) {
+    for (let col = 0; col < GRID_COLS; col++) {
+      const centerX = baseX + (col - colOffset) * GRID_SPACING;
+      const centerY = baseY + (row - rowOffset) * GRID_SPACING;
+
+      const stats = computeWindowStats(
+        pixels,
+        width,
+        height,
+        centerX,
+        centerY,
+        GRID_CELL_SIZE
+      );
+
+      regions.push({
+        row,
+        col,
+        name: `r${row}_c${col}`,
+        ...stats,
+      });
+    }
+  }
+
+  return {
+    rows: GRID_ROWS,
+    cols: GRID_COLS,
+    cellWindowSize: GRID_CELL_SIZE,
+    spacingPixels: GRID_SPACING,
+    regions,
   };
 }
 
@@ -358,24 +384,22 @@ async function initAR() {
     return;
   }
 
+  initDebugDrawResources();
+
   xrSession = await navigator.xr.requestSession("immersive-ar", {
     requiredFeatures: ["local", "depth-sensing"],
     optionalFeatures: ["hand-tracking"],
     depthSensing: {
       usagePreference: ["gpu-optimized", "cpu-optimized"],
-      dataFormatPreference: ["luminance-alpha", "float32"],
+      dataFormatPreference: ["unsigned-short", "float32", "luminance-alpha"],
     },
   });
-
-  log("XR session created.");
-  log("depthUsage:", xrSession.depthUsage ?? "undefined");
-  log("depthDataFormat:", xrSession.depthDataFormat ?? "undefined");
 
   xrSession.addEventListener("end", () => {
     log("XR session ended.");
     xrSession = null;
     xrRefSpace = null;
-    glBinding = null;
+    xrGlBinding = null;
   });
 
   xrSession.addEventListener("select", (event) => {
@@ -389,19 +413,18 @@ async function initAR() {
 
   await gl.makeXRCompatible();
 
-  const baseLayer = new XRWebGLLayer(xrSession, gl, { alpha: true });
+  const baseLayer = new XRWebGLLayer(xrSession, gl, {
+    alpha: true,
+  });
+
   xrSession.updateRenderState({ baseLayer });
-
   xrRefSpace = await xrSession.requestReferenceSpace("local");
-  glBinding = new XRWebGLBinding(xrSession, gl);
 
-  initQuadBuffer();
-  initPreviewPipeline();
-  initReadbackPipeline();
+  // GPU 路径
+  xrGlBinding = new XRWebGLBinding(xrSession, gl);
 
   log("AR session started.");
-  log("GPU depth preview should appear in the top-right area.");
-  log("Pinch to capture center raw depth sample.");
+  log("Use pinch to capture a snapshot.");
 
   xrSession.requestAnimationFrame(onXRFrame);
 }
@@ -419,96 +442,171 @@ function onXRFrame(time, frame) {
   gl.clearColor(0.0, 0.0, 0.0, 0.0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-  // 只用左眼 view 做预览和读取
   const view = pose.views[0];
   if (!view) return;
 
-  const viewport = baseLayer.getViewport(view);
-
-  let depthInfo = null;
-  if (xrSession.depthUsage === "gpu-optimized" && glBinding) {
-    try {
-      depthInfo = glBinding.getDepthInformation(view);
-      if (depthInfo) {
-        drawGpuDepthPreview(depthInfo, viewport);
-      }
-    } catch (err) {
-      console.error("GPU depth preview failed:", err);
-    }
-  }
-
   if (pendingSnapshot) {
     pendingSnapshot = false;
-    debugLogs = [];
-    log("----- SNAPSHOT START -----");
-    log("pose views count:", pose.views.length);
-    log("depthUsage runtime:", xrSession.depthUsage ?? "undefined");
-    log("depthDataFormat runtime:", xrSession.depthDataFormat ?? "undefined");
 
-    let rawCenterSample = null;
+    const debugLogs = [];
+    debugLogs.push("----- SNAPSHOT START -----");
+    debugLogs.push(`pose views count: ${pose.views.length}`);
 
+    let depthInfo = null;
+    let depthPath = "none";
+
+    // 先试 GPU 路径
     try {
-      if (xrSession.depthUsage === "gpu-optimized") {
-        log("depth path:", "gpu");
-        log("depthInfo exists:", depthInfo !== null);
-
-        if (depthInfo) {
-          log("depth width:", depthInfo.width);
-          log("depth height:", depthInfo.height);
-          log("textureType:", depthInfo.textureType ?? "unknown");
-          log("imageIndex:", depthInfo.imageIndex ?? "unknown");
-
-          rawCenterSample = readCenterDepthRaw(depthInfo);
-          log("raw center rgba:", JSON.stringify(rawCenterSample.rgba));
-          log("raw center gray01:", rawCenterSample.gray01);
-        }
-      } else {
-        log("This test page is intended for gpu-optimized depth.");
+      if (xrGlBinding) {
+        depthInfo = xrGlBinding.getDepthInformation(view);
+        if (depthInfo) depthPath = "gpu";
       }
     } catch (err) {
-      log("gpu center read failed:", err.name, err.message);
+      debugLogs.push(`gpu getDepthInformation failed: ${err.message}`);
     }
 
-    const latestSnapshot = {
+    // 再退回 CPU 路径
+    if (!depthInfo) {
+      try {
+        depthInfo = frame.getDepthInformation(view);
+        if (depthInfo) depthPath = "cpu";
+      } catch (err) {
+        debugLogs.push(`cpu getDepthInformation failed: ${err.message}`);
+      }
+    }
+
+    debugLogs.push(`depthUsage runtime: ${xrSession.depthUsage || "unknown"}`);
+    debugLogs.push(`depthDataFormat runtime: ${xrSession.depthDataFormat || "unknown"}`);
+    debugLogs.push(`depth path: ${depthPath}`);
+    debugLogs.push(`depthInfo exists: ${depthInfo !== null}`);
+
+    let depthSummary = null;
+    let rawCenterSample = null;
+    let centerRegionStats = null;
+    let regionGridStats = null;
+
+    if (depthInfo) {
+      debugLogs.push(`depth width: ${depthInfo.width}`);
+      debugLogs.push(`depth height: ${depthInfo.height}`);
+
+      if (depthPath === "gpu") {
+        depthSummary = {
+          width: depthInfo.width,
+          height: depthInfo.height,
+          textureType: depthInfo.textureType,
+          imageIndex: depthInfo.imageIndex ?? 0,
+          type: "gpu",
+        };
+
+        debugLogs.push(`textureType: ${depthInfo.textureType}`);
+        debugLogs.push(`imageIndex: ${depthInfo.imageIndex ?? 0}`);
+
+        try {
+          drawDepthTextureToDebugColor(depthInfo);
+          const pixels = readDebugColorPixels();
+
+          const centerX = Math.floor(depthInfo.width / 2);
+          const centerY = Math.floor(depthInfo.height / 2);
+
+          const centerRGBA = getPixelRGBA(pixels, depthInfo.width, centerX, centerY);
+          rawCenterSample = {
+            rgba: centerRGBA,
+            gray01: rgbaToGray01(centerRGBA),
+          };
+
+          centerRegionStats = computeWindowStats(
+            pixels,
+            depthInfo.width,
+            depthInfo.height,
+            centerX,
+            centerY,
+            CENTER_WINDOW_SIZE
+          );
+
+          regionGridStats = computeGridStats(
+            pixels,
+            depthInfo.width,
+            depthInfo.height,
+            centerX,
+            centerY
+          );
+
+          debugLogs.push(`raw center rgba: [${centerRGBA.join(",")}]`);
+          debugLogs.push(`raw center gray01: ${rawCenterSample.gray01}`);
+          debugLogs.push(`center region meanGray01: ${centerRegionStats.meanGray01}`);
+        } catch (err) {
+          debugLogs.push(`gpu readback failed: ${err.message}`);
+        }
+      } else {
+        // CPU 路径可直接拿米
+        try {
+          const centerDepthMeters = depthInfo.getDepthInMeters(0.5, 0.5);
+          rawCenterSample = {
+            gray01: null,
+            depthMeters: sanitizeNumber(centerDepthMeters),
+          };
+          debugLogs.push(`cpu center depth meters: ${centerDepthMeters}`);
+        } catch (err) {
+          debugLogs.push(`cpu center depth read failed: ${err.message}`);
+        }
+
+        depthSummary = {
+          width: depthInfo.width,
+          height: depthInfo.height,
+          type: "cpu",
+        };
+      }
+    }
+
+    latestSnapshot = {
       timestamp: new Date().toISOString(),
-      sessionMode: session.mode,
       referenceSpaceType: "local",
       camera: {
         transform: poseToJSON(view.transform),
         projectionMatrix: flattenMatrix(view.projectionMatrix),
       },
-      depthUsage: xrSession.depthUsage ?? null,
-      depthDataFormat: xrSession.depthDataFormat ?? null,
-      depthSummary: depthInfo
-        ? {
-            width: depthInfo.width,
-            height: depthInfo.height,
-            textureType: depthInfo.textureType ?? null,
-            imageIndex: depthInfo.imageIndex ?? null,
-            type: "gpu",
-          }
-        : null,
-      rawCenterSample: rawCenterSample,
-      debugLogs: [],
+      depthUsage: xrSession.depthUsage || null,
+      depthDataFormat: xrSession.depthDataFormat || null,
+      depthSummary,
+      rawCenterSample,
+      centerRegionStats,
+      regionGridStats,
+      debugLogs,
       notes: [
-        "rawCenterSample is not meters yet",
-        "it is a GPU readback debug value",
-        "use it to test whether near/far viewing changes the sampled value",
+        "rawCenterSample.gray01 is not meters",
+        "centerRegionStats is the mean/min/max of a center window",
+        "regionGridStats is a 3x3 grid around the center",
+        "these values are useful as relative depth cues"
       ],
     };
 
-    log("snapshot-depth.json download triggered.");
-    log("----- SNAPSHOT END -----");
+    debugLogs.push("snapshot-depth.json download triggered.");
+    debugLogs.push("----- SNAPSHOT END -----");
 
-    latestSnapshot.debugLogs = [...debugLogs];
     downloadJSON(latestSnapshot, "snapshot-depth.json");
+    log("snapshot-depth.json download triggered.");
   }
+}
+
+function downloadJSON(obj, filename = "snapshot-depth.json") {
+  const blob = new Blob(
+    [JSON.stringify(obj, null, 2)],
+    { type: "application/json" }
+  );
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 enterArBtn.addEventListener("click", async () => {
   try {
     await initAR();
   } catch (err) {
-    log("Failed to start AR:", err.name, err.message);
+    log("Failed to start AR:", err.message);
+    console.error(err);
   }
 });
