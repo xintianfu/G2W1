@@ -191,14 +191,21 @@ function onXRFrame(time, frame) {
     let depthInfo = null;
     try {
       depthInfo = frame.getDepthInformation(view);
+      log("depthInfo exists:", depthInfo !== null);
     } catch (err) {
-      log("getDepthInformation failed:", err.message);
+      log("getDepthInformation failed:", err.name, err.message);
     }
 
+    if (depthInfo) {
+      log("depth width:", depthInfo.width);
+      log("depth height:", depthInfo.height);
+      log("rawValueToMeters:", depthInfo.rawValueToMeters);
+    }
     let centerDepth = null;
     if (depthInfo) {
       try {
         centerDepth = depthInfo.getDepthInMeters(0.5, 0.5);
+        log("center depth:", centerDepth);
       } catch (err) {
         log("center depth read failed:", err.message);
       }
@@ -207,10 +214,15 @@ function onXRFrame(time, frame) {
     latestSnapshot = {
       timestamp: new Date().toISOString(),
       sessionMode: session.mode,
-      referenceSpaceType: "local",
+      referenceSpaceType: "local", //根据头显位置的相对位置
       camera: {
         transform: poseToJSON(view.transform),
-        projectionMatrix: flattenMatrix(view.projectionMatrix),
+        //position: x:我左右移动; y:我上下移动; z:我前后移动; 
+        //orientation: x,y,z,w 四元数表示旋转
+        //matrix：前面两个信息的相机4x4变换矩阵，包含位置和旋转信息
+        //inverseMatrix：相机变换的逆矩阵，可以用于将世界坐标转换到相机坐标，投影用
+        projectionMatrix: flattenMatrix(view.projectionMatrix), //一个方法矩阵，帮助3d坐标
+        // 变成2d坐标
       },
       centerDepthMeters: sanitizeNumber(centerDepth),
       depth: depthInfo ? serializeDepthMap(depthInfo, 8) : null,
