@@ -13,11 +13,11 @@ let lastPinchTime = 0;
 const PINCH_COOLDOWN_MS = 1200;
 
 // ===== depth sampling config =====
-const CENTER_WINDOW_SIZE = 9;   // 中心区域 9x9
-const GRID_ROWS = 3;            // 3x3 区域
-const GRID_COLS = 3;
-const GRID_CELL_SIZE = 9;       // 每个区域窗口 9x9
-const GRID_SPACING = 18;        // 区域中心之间的像素间隔
+const CENTER_WINDOW_SIZE = 15;   // 中心区域 9x9
+const GRID_ROWS = 5;            // 3x3 区域
+const GRID_COLS = 5;
+const GRID_CELL_SIZE = 15;       // 每个区域窗口 9x9
+const GRID_SPACING = 24;        // 区域中心之间的像素间隔
 
 // ===== GPU debug readback resources =====
 let debugProgram = null;
@@ -326,8 +326,8 @@ function computeWindowStats(pixels, width, height, centerX, centerY, windowSize)
 
 function computeGridStats(pixels, width, height, baseX, baseY) {
   const regions = [];
-  const rowOffset = Math.floor(GRID_ROWS / 2);
-  const colOffset = Math.floor(GRID_COLS / 2);
+  const rowOffset = (GRID_ROWS - 1) / 2;
+  const colOffset = (GRID_COLS - 1) / 2;
 
   for (let row = 0; row < GRID_ROWS; row++) {
     for (let col = 0; col < GRID_COLS; col++) {
