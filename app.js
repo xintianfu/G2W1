@@ -196,29 +196,62 @@ function onXRFrame(time, frame) {
     log("----- SNAPSHOT START -----");
 
     log("pose views count:", pose.views.length);
+    log("depthUsage runtime:", xrSession.depthUsage ?? "undefined");
+    log("depthDataFormat runtime:", xrSession.depthDataFormat ?? "undefined");
 
     let depthInfo = null;
-    try {
-      depthInfo = frame.getDepthInformation(view);
-      log("depthInfo exists:", depthInfo !== null);
-    } catch (err) {
-      log("getDepthInformation failed:", err.name, err.message);
-    }
-
-    if (depthInfo) {
-      log("depth width:", depthInfo.width);
-      log("depth height:", depthInfo.height);
-      log("rawValueToMeters:", depthInfo.rawValueToMeters);
-    }
-
     let centerDepth = null;
-    if (depthInfo) {
-      try {
-        centerDepth = depthInfo.getDepthInMeters(0.5, 0.5);
-        log("center depth:", centerDepth);
-      } catch (err) {
-        log("center depth read failed:", err.name, err.message);
+    let depthMode = xrSession.depthUsage ?? null;
+    let depthSummary = null;
+
+    try {
+      if (xrSession.depthUsage === "cpu-optimized") {
+        depthInfo = frame.getDepthInformation(view);
+        log("depth path:", "cpu");
+        log("depthInfo exists:", depthInfo !== null);
+
+        if (depthInfo) {
+          log("depth width:", depthInfo.width);
+          log("depth height:", depthInfo.height);
+          log("rawValueToMeters:", depthInfo.rawValueToMeters);
+
+          try {
+            centerDepth = depthInfo.getDepthInMeters(0.5, 0.5);
+            log("center depth:", centerDepth);
+          } catch (err) {
+            log("center depth read failed:", err.name, err.message);
+          }
+
+          depthSummary = {
+            width: depthInfo.width,
+            height: depthInfo.height,
+            rawValueToMeters: depthInfo.rawValueToMeters ?? null,
+            type: "cpu",
+          };
+        }
+      } else if (xrSession.depthUsage === "gpu-optimized") {
+        const glBinding = new XRWebGLBinding(xrSession, gl);
+        depthInfo = glBinding.getDepthInformation(view);
+        log("depth path:", "gpu");
+        log("depthInfo exists:", depthInfo !== null);
+
+        if (depthInfo) {
+          log("depth width:", depthInfo.width);
+          log("depth height:", depthInfo.height);
+          log("textureType:", depthInfo.textureType ?? "unknown");
+
+          depthSummary = {
+            width: depthInfo.width,
+            height: depthInfo.height,
+            textureType: depthInfo.textureType ?? null,
+            type: "gpu",
+          };
+        }
+      } else {
+        log("depthUsage unsupported or undefined:", xrSession.depthUsage);
       }
+    } catch (err) {
+      log("depth read failed:", err.name, err.message);
     }
 
     latestSnapshot = {
@@ -229,13 +262,19 @@ function onXRFrame(time, frame) {
         transform: poseToJSON(view.transform),
         projectionMatrix: flattenMatrix(view.projectionMatrix),
       },
+      depthUsage: depthMode,
       centerDepthMeters: sanitizeNumber(centerDepth),
-      depth: depthInfo ? serializeDepthMap(depthInfo, 8) : null,
+      depthSummary: depthSummary,
+      depth:
+        xrSession.depthUsage === "cpu-optimized" && depthInfo
+          ? serializeDepthMap(depthInfo, 8)
+          : null,
       debugLogs: debugLogs,
       notes: [
-        "depth.samplesMeters is a sampled depth map in meters",
-        "this is not object segmentation",
-        "to isolate objects, you still need region annotation or segmentation",
+        "If depthUsage is cpu-optimized, depth contains sampled meters.",
+        "If depthUsage is gpu-optimized, depth may only be available as a GPU texture summary.",
+        "This is not object segmentation.",
+        "To isolate objects, you still need region annotation or segmentation.",
       ],
     };
 
@@ -248,6 +287,16 @@ function onXRFrame(time, frame) {
         latestSnapshot.depth.sampleStep,
         "centerDepth:",
         latestSnapshot.centerDepthMeters
+      );
+    } else if (latestSnapshot.depthSummary) {
+      log(
+        "Snapshot captured with depth summary only.",
+        "type:",
+        latestSnapshot.depthSummary.type,
+        "width:",
+        latestSnapshot.depthSummary.width,
+        "height:",
+        latestSnapshot.depthSummary.height
       );
     } else {
       log("Snapshot captured, but no depth info returned.");
