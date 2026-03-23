@@ -136,6 +136,9 @@ async function initAR() {
       dataFormatPreference: ["float32", "luminance-alpha"],
     },
   });
+  log("XR session created.");
+  log("depthUsage:", xrSession.depthUsage ?? "undefined");
+  log("depthDataFormat:", xrSession.depthDataFormat ?? "undefined");
 
   xrSession.addEventListener("end", () => {
     log("XR session ended.");
@@ -182,10 +185,12 @@ function onXRFrame(time, frame) {
   gl.clearColor(0.0, 0.0, 0.0, 0.0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
+  log("pose views count:", pose.views.length);
   const view = pose.views[0];
   if (!view) return;
 
   if (pendingSnapshot) {
+    log("----- SNAPSHOT START -----");
     pendingSnapshot = false;
 
     let depthInfo = null;
@@ -248,6 +253,7 @@ function onXRFrame(time, frame) {
     }
 
     downloadJSON(latestSnapshot, "snapshot-depth.json");
+    log("----- SNAPSHOT END -----");
     log("snapshot-depth.json download triggered.");
   }
 }
