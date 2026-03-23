@@ -11,9 +11,12 @@ let latestSnapshot = null;
 let lastPinchTime = 0;
 const PINCH_COOLDOWN_MS = 1200;
 
+let debugLogs = [];
+
 function log(...args) {
   const msg = args.map(String).join(" ");
   console.log(msg);
+  debugLogs.push(msg);
   logEl.textContent += "\n" + msg;
   logEl.scrollTop = logEl.scrollHeight;
 }
@@ -136,6 +139,7 @@ async function initAR() {
       dataFormatPreference: ["float32", "luminance-alpha"],
     },
   });
+
   log("XR session created.");
   log("depthUsage:", xrSession.depthUsage ?? "undefined");
   log("depthDataFormat:", xrSession.depthDataFormat ?? "undefined");
@@ -146,7 +150,6 @@ async function initAR() {
     xrRefSpace = null;
   });
 
-  // pinch/select 触发 snapshot
   xrSession.addEventListener("select", (event) => {
     if (isHandInputSource(event.inputSource)) {
       const handedness = event.inputSource.handedness || "unknown-hand";
@@ -181,17 +184,18 @@ function onXRFrame(time, frame) {
   const baseLayer = session.renderState.baseLayer;
   gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
 
-  // 透明背景，显示真实世界 passthrough
   gl.clearColor(0.0, 0.0, 0.0, 0.0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-  log("pose views count:", pose.views.length);
   const view = pose.views[0];
   if (!view) return;
 
   if (pendingSnapshot) {
-    log("----- SNAPSHOT START -----");
     pendingSnapshot = false;
+    debugLogs = [];
+    log("----- SNAPSHOT START -----");
+
+    log("pose views count:", pose.views.length);
 
     let depthInfo = null;
     try {
@@ -206,31 +210,28 @@ function onXRFrame(time, frame) {
       log("depth height:", depthInfo.height);
       log("rawValueToMeters:", depthInfo.rawValueToMeters);
     }
+
     let centerDepth = null;
     if (depthInfo) {
       try {
         centerDepth = depthInfo.getDepthInMeters(0.5, 0.5);
         log("center depth:", centerDepth);
       } catch (err) {
-        log("center depth read failed:", err.message);
+        log("center depth read failed:", err.name, err.message);
       }
     }
 
     latestSnapshot = {
       timestamp: new Date().toISOString(),
       sessionMode: session.mode,
-      referenceSpaceType: "local", //根据头显位置的相对位置
+      referenceSpaceType: "local",
       camera: {
         transform: poseToJSON(view.transform),
-        //position: x:我左右移动; y:我上下移动; z:我前后移动; 
-        //orientation: x,y,z,w 四元数表示旋转
-        //matrix：前面两个信息的相机4x4变换矩阵，包含位置和旋转信息
-        //inverseMatrix：相机变换的逆矩阵，可以用于将世界坐标转换到相机坐标，投影用
-        projectionMatrix: flattenMatrix(view.projectionMatrix), //一个方法矩阵，帮助3d坐标
-        // 变成2d坐标
+        projectionMatrix: flattenMatrix(view.projectionMatrix),
       },
       centerDepthMeters: sanitizeNumber(centerDepth),
       depth: depthInfo ? serializeDepthMap(depthInfo, 8) : null,
+      debugLogs: debugLogs,
       notes: [
         "depth.samplesMeters is a sampled depth map in meters",
         "this is not object segmentation",
@@ -252,9 +253,11 @@ function onXRFrame(time, frame) {
       log("Snapshot captured, but no depth info returned.");
     }
 
-    downloadJSON(latestSnapshot, "snapshot-depth.json");
-    log("----- SNAPSHOT END -----");
     log("snapshot-depth.json download triggered.");
+    log("----- SNAPSHOT END -----");
+
+    latestSnapshot.debugLogs = [...debugLogs];
+    downloadJSON(latestSnapshot, "snapshot-depth.json");
   }
 }
 
@@ -262,6 +265,6 @@ enterArBtn.addEventListener("click", async () => {
   try {
     await initAR();
   } catch (err) {
-    log("Failed to start AR:", err.message);
+    log("Failed to start AR:", err.name, err.message);
   }
 });
