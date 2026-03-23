@@ -5,13 +5,13 @@ const enterArBtn = document.getElementById("enter-ar");
 let gl = null;
 let xrSession = null;
 let xrRefSpace = null;
-
-let pendingSnapshot = false;
-let latestSnapshot = null;
-let lastPinchTime = 0;
-const PINCH_COOLDOWN_MS = 1200;
+let glBinding = null;
 
 let debugLogs = [];
+
+// GPU depth preview program
+let previewProgram = null;
+let previewVbo = null;
 
 function log(...args) {
   const msg = args.map(String).join(" ");
@@ -21,91 +21,148 @@ function log(...args) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-function flattenMatrix(mat) {
-  return Array.from(mat);
-}
-
-function poseToJSON(xrRigidTransform) {
-  return {
-    position: {
-      x: xrRigidTransform.position.x,
-      y: xrRigidTransform.position.y,
-      z: xrRigidTransform.position.z,
-      w: xrRigidTransform.position.w,
-    },
-    orientation: {
-      x: xrRigidTransform.orientation.x,
-      y: xrRigidTransform.orientation.y,
-      z: xrRigidTransform.orientation.z,
-      w: xrRigidTransform.orientation.w,
-    },
-    matrix: flattenMatrix(xrRigidTransform.matrix),
-    inverseMatrix: flattenMatrix(xrRigidTransform.inverse.matrix),
-  };
-}
-
-function sanitizeNumber(v) {
-  return Number.isFinite(v) ? v : null;
-}
-
-function serializeDepthMap(depthInfo, sampleStep = 8) {
-  const width = depthInfo.width;
-  const height = depthInfo.height;
-
-  const samples = [];
-  for (let py = 0; py < height; py += sampleStep) {
-    const row = [];
-    for (let px = 0; px < width; px += sampleStep) {
-      const nx = width > 1 ? px / (width - 1) : 0;
-      const ny = height > 1 ? py / (height - 1) : 0;
-      const d = depthInfo.getDepthInMeters(nx, ny);
-      row.push(sanitizeNumber(d));
-    }
-    samples.push(row);
+function compileShader(gl, type, source) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, source);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const info = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error("Shader compile failed: " + info);
   }
-
-  return {
-    width,
-    height,
-    sampleStep,
-    sampledWidth: samples[0] ? samples[0].length : 0,
-    sampledHeight: samples.length,
-    rawValueToMeters: depthInfo.rawValueToMeters ?? null,
-    normDepthBufferFromNormView: depthInfo.normDepthBufferFromNormView
-      ? flattenMatrix(depthInfo.normDepthBufferFromNormView.matrix)
-      : null,
-    samplesMeters: samples,
-  };
+  return s;
 }
 
-function downloadJSON(obj, filename = "snapshot-depth.json") {
-  const blob = new Blob(
-    [JSON.stringify(obj, null, 2)],
-    { type: "application/json" }
+function createProgram(gl, vsSource, fsSource) {
+  const vs = compileShader(gl, gl.VERTEX_SHADER, vsSource);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  gl.linkProgram(p);
+
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    const info = gl.getProgramInfoLog(p);
+    gl.deleteProgram(p);
+    throw new Error("Program link failed: " + info);
+  }
+  return p;
+}
+
+function initPreviewPipeline() {
+  const vs = `#version 300 es
+    in vec2 a_pos;
+    out vec2 v_uv;
+    void main() {
+      v_uv = a_pos * 0.5 + 0.5;
+      gl_Position = vec4(a_pos, 0.0, 1.0);
+    }
+  `;
+
+  // 这版先做“相对灰度预览”
+  // 对于 gpu-optimized + texture-array，我们按 sampler2DArray 采样
+  // 用 red 通道先看是否存在合理深浅变化
+  const fs = `#version 300 es
+    precision highp float;
+    precision highp sampler2DArray;
+
+    in vec2 v_uv;
+    out vec4 outColor;
+
+    uniform sampler2DArray u_depthTex;
+    uniform mat4 u_uvTransform;
+    uniform float u_imageIndex;
+    uniform float u_opacity;
+
+    vec2 transformUV(vec2 uv) {
+      vec4 t = u_uvTransform * vec4(uv, 0.0, 1.0);
+      return t.xy;
+    }
+
+    void main() {
+      vec2 duv = transformUV(v_uv);
+
+      // texture-array 路径
+      vec4 texel = texture(u_depthTex, vec3(duv, u_imageIndex));
+
+      // 这里只做可视化，不保证是米制深度
+      // 先用 red 通道看相对深浅
+      float depthVis = texel.r;
+
+      // 近处亮/远处暗，你也可以改成 1.0 - depthVis
+      float gray = 1.0 - clamp(depthVis, 0.0, 1.0);
+
+      outColor = vec4(vec3(gray), u_opacity);
+    }
+  `;
+
+  previewProgram = createProgram(gl, vs, fs);
+
+  previewVbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, previewVbo);
+  gl.bufferData(
+    gl.ARRAY_BUFFER,
+    new Float32Array([
+      -1, -1,
+       1, -1,
+      -1,  1,
+      -1,  1,
+       1, -1,
+       1,  1,
+    ]),
+    gl.STATIC_DRAW
+  );
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+}
+
+function drawGpuDepthPreview(depthInfo, viewport) {
+  if (!previewProgram || !depthInfo) return;
+
+  gl.useProgram(previewProgram);
+
+  // 在右上角画一个小预览窗
+  const x = Math.floor(viewport.x + viewport.width * 0.60);
+  const y = Math.floor(viewport.y + viewport.height * 0.55);
+  const w = Math.floor(viewport.width * 0.35);
+  const h = Math.floor(viewport.height * 0.35);
+  gl.viewport(x, y, w, h);
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  const aPos = gl.getAttribLocation(previewProgram, "a_pos");
+  const uDepthTex = gl.getUniformLocation(previewProgram, "u_depthTex");
+  const uUvTransform = gl.getUniformLocation(previewProgram, "u_uvTransform");
+  const uImageIndex = gl.getUniformLocation(previewProgram, "u_imageIndex");
+  const uOpacity = gl.getUniformLocation(previewProgram, "u_opacity");
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, previewVbo);
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, depthInfo.texture);
+  gl.uniform1i(uDepthTex, 0);
+
+  gl.uniformMatrix4fv(
+    uUvTransform,
+    false,
+    depthInfo.normDepthBufferFromNormView.matrix
   );
 
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
+  gl.uniform1f(uImageIndex, depthInfo.imageIndex ?? 0);
+  gl.uniform1f(uOpacity, 0.85);
 
-function requestSnapshot(reason = "manual") {
-  const now = Date.now();
-  if (now - lastPinchTime < PINCH_COOLDOWN_MS) {
-    log("Pinch ignored: cooldown active.");
-    return;
-  }
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-  lastPinchTime = now;
-  pendingSnapshot = true;
-  log("Snapshot requested by", reason);
-}
-
-function isHandInputSource(inputSource) {
-  return inputSource && inputSource.hand;
+  gl.disableVertexAttribArray(aPos);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+  gl.disable(gl.BLEND);
 }
 
 async function initAR() {
@@ -133,10 +190,9 @@ async function initAR() {
 
   xrSession = await navigator.xr.requestSession("immersive-ar", {
     requiredFeatures: ["local", "depth-sensing"],
-    optionalFeatures: ["hand-tracking"],
     depthSensing: {
-      usagePreference: ["cpu-optimized"],
-      dataFormatPreference: ["float32", "luminance-alpha"],
+      usagePreference: ["gpu-optimized", "cpu-optimized"],
+      dataFormatPreference: ["luminance-alpha", "float32"],
     },
   });
 
@@ -148,28 +204,21 @@ async function initAR() {
     log("XR session ended.");
     xrSession = null;
     xrRefSpace = null;
-  });
-
-  xrSession.addEventListener("select", (event) => {
-    if (isHandInputSource(event.inputSource)) {
-      const handedness = event.inputSource.handedness || "unknown-hand";
-      requestSnapshot(`pinch-${handedness}`);
-    } else {
-      requestSnapshot("select-non-hand");
-    }
+    glBinding = null;
   });
 
   await gl.makeXRCompatible();
 
-  const baseLayer = new XRWebGLLayer(xrSession, gl, {
-    alpha: true,
-  });
-
+  const baseLayer = new XRWebGLLayer(xrSession, gl, { alpha: true });
   xrSession.updateRenderState({ baseLayer });
+
   xrRefSpace = await xrSession.requestReferenceSpace("local");
+  glBinding = new XRWebGLBinding(xrSession, gl);
+
+  initPreviewPipeline();
 
   log("AR session started.");
-  log("Use pinch to capture a snapshot.");
+  log("GPU depth preview should appear in the top-right area.");
 
   xrSession.requestAnimationFrame(onXRFrame);
 }
@@ -184,129 +233,26 @@ function onXRFrame(time, frame) {
   const baseLayer = session.renderState.baseLayer;
   gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
 
+  // 保持真实世界透视
   gl.clearColor(0.0, 0.0, 0.0, 0.0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-  const view = pose.views[0];
-  if (!view) return;
+  for (const view of pose.views) {
+    const viewport = baseLayer.getViewport(view);
+    gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
 
-  if (pendingSnapshot) {
-    pendingSnapshot = false;
-    debugLogs = [];
-    log("----- SNAPSHOT START -----");
-
-    log("pose views count:", pose.views.length);
-    log("depthUsage runtime:", xrSession.depthUsage ?? "undefined");
-    log("depthDataFormat runtime:", xrSession.depthDataFormat ?? "undefined");
-
-    let depthInfo = null;
-    let centerDepth = null;
-    let depthMode = xrSession.depthUsage ?? null;
-    let depthSummary = null;
-
-    try {
-      if (xrSession.depthUsage === "cpu-optimized") {
-        depthInfo = frame.getDepthInformation(view);
-        log("depth path:", "cpu");
-        log("depthInfo exists:", depthInfo !== null);
-
+    // 如果是 gpu-optimized，就尝试预览 depth 纹理
+    if (xrSession.depthUsage === "gpu-optimized" && glBinding) {
+      try {
+        const depthInfo = glBinding.getDepthInformation(view);
         if (depthInfo) {
-          log("depth width:", depthInfo.width);
-          log("depth height:", depthInfo.height);
-          log("rawValueToMeters:", depthInfo.rawValueToMeters);
-
-          try {
-            centerDepth = depthInfo.getDepthInMeters(0.5, 0.5);
-            log("center depth:", centerDepth);
-          } catch (err) {
-            log("center depth read failed:", err.name, err.message);
-          }
-
-          depthSummary = {
-            width: depthInfo.width,
-            height: depthInfo.height,
-            rawValueToMeters: depthInfo.rawValueToMeters ?? null,
-            type: "cpu",
-          };
+          drawGpuDepthPreview(depthInfo, viewport);
         }
-      } else if (xrSession.depthUsage === "gpu-optimized") {
-        const glBinding = new XRWebGLBinding(xrSession, gl);
-        depthInfo = glBinding.getDepthInformation(view);
-        log("depth path:", "gpu");
-        log("depthInfo exists:", depthInfo !== null);
-
-        if (depthInfo) {
-          log("depth width:", depthInfo.width);
-          log("depth height:", depthInfo.height);
-          log("textureType:", depthInfo.textureType ?? "unknown");
-
-          depthSummary = {
-            width: depthInfo.width,
-            height: depthInfo.height,
-            textureType: depthInfo.textureType ?? null,
-            type: "gpu",
-          };
-        }
-      } else {
-        log("depthUsage unsupported or undefined:", xrSession.depthUsage);
+      } catch (err) {
+        // 避免每帧刷爆日志，只在控制台留痕
+        console.error("GPU depth preview failed:", err);
       }
-    } catch (err) {
-      log("depth read failed:", err.name, err.message);
     }
-
-    latestSnapshot = {
-      timestamp: new Date().toISOString(),
-      sessionMode: session.mode,
-      referenceSpaceType: "local",
-      camera: {
-        transform: poseToJSON(view.transform),
-        projectionMatrix: flattenMatrix(view.projectionMatrix),
-      },
-      depthUsage: depthMode,
-      centerDepthMeters: sanitizeNumber(centerDepth),
-      depthSummary: depthSummary,
-      depth:
-        xrSession.depthUsage === "cpu-optimized" && depthInfo
-          ? serializeDepthMap(depthInfo, 8)
-          : null,
-      debugLogs: debugLogs,
-      notes: [
-        "If depthUsage is cpu-optimized, depth contains sampled meters.",
-        "If depthUsage is gpu-optimized, depth may only be available as a GPU texture summary.",
-        "This is not object segmentation.",
-        "To isolate objects, you still need region annotation or segmentation.",
-      ],
-    };
-
-    if (latestSnapshot.depth) {
-      log(
-        "Snapshot captured.",
-        "Depth size:",
-        `${latestSnapshot.depth.width}x${latestSnapshot.depth.height}`,
-        "sampleStep:",
-        latestSnapshot.depth.sampleStep,
-        "centerDepth:",
-        latestSnapshot.centerDepthMeters
-      );
-    } else if (latestSnapshot.depthSummary) {
-      log(
-        "Snapshot captured with depth summary only.",
-        "type:",
-        latestSnapshot.depthSummary.type,
-        "width:",
-        latestSnapshot.depthSummary.width,
-        "height:",
-        latestSnapshot.depthSummary.height
-      );
-    } else {
-      log("Snapshot captured, but no depth info returned.");
-    }
-
-    log("snapshot-depth.json download triggered.");
-    log("----- SNAPSHOT END -----");
-
-    latestSnapshot.debugLogs = [...debugLogs];
-    downloadJSON(latestSnapshot, "snapshot-depth.json");
   }
 }
 
