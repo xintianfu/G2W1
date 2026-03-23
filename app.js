@@ -13,11 +13,18 @@ let lastPinchTime = 0;
 const PINCH_COOLDOWN_MS = 1200;
 
 // ===== depth sampling config =====
-const CENTER_WINDOW_SIZE = 15;   // 中心区域 9x9
-const GRID_ROWS = 5;            // 3x3 区域
+const CENTER_WINDOW_SIZE = 15;
+const GRID_ROWS = 5;
 const GRID_COLS = 5;
-const GRID_CELL_SIZE = 15;       // 每个区域窗口 9x9
-const GRID_SPACING = 24;        // 区域中心之间的像素间隔
+const GRID_CELL_SIZE = 15;
+const GRID_SPACING = 24;
+
+// ===== heatmap panel config =====
+const PANEL_DISTANCE = 0.7;   // 前方 0.7m
+const PANEL_OFFSET_X = 0.0;   // 左右偏移
+const PANEL_OFFSET_Y = 0.0;   // 上下偏移
+const PANEL_WIDTH = 0.28;     // 面板宽（米）
+const PANEL_HEIGHT = 0.20;    // 面板高（米）
 
 // ===== GPU debug readback resources =====
 let debugProgram = null;
@@ -26,6 +33,14 @@ let debugColorTex = null;
 let debugFbo = null;
 let debugDepthWidth = 0;
 let debugDepthHeight = 0;
+
+// ===== panel rendering resources =====
+let panelProgram = null;
+let panelVAO = null;
+let panelTexture = null;
+let panelCanvas = null;
+let panelCtx = null;
+let panelTextureDirty = false;
 
 function log(...args) {
   const msg = args.map(String).join(" ");
@@ -111,8 +126,41 @@ function createProgram(gl, vsSource, fsSource) {
   return program;
 }
 
+function multiplyMat4(a, b) {
+  const out = new Float32Array(16);
+
+  for (let col = 0; col < 4; col++) {
+    for (let row = 0; row < 4; row++) {
+      out[col * 4 + row] =
+        a[0 * 4 + row] * b[col * 4 + 0] +
+        a[1 * 4 + row] * b[col * 4 + 1] +
+        a[2 * 4 + row] * b[col * 4 + 2] +
+        a[3 * 4 + row] * b[col * 4 + 3];
+    }
+  }
+
+  return out;
+}
+
+function makeTranslationMatrix(tx, ty, tz) {
+  return new Float32Array([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    tx, ty, tz, 1,
+  ]);
+}
+
+function makeScaleMatrix(sx, sy, sz) {
+  return new Float32Array([
+    sx, 0, 0, 0,
+    0, sy, 0, 0,
+    0, 0, sz, 0,
+    0, 0, 0, 1,
+  ]);
+}
+
 function initDebugDrawResources() {
-  // 一个最简单的 fullscreen triangle
   const vsSource = `#version 300 es
     const vec2 POS[3] = vec2[](
       vec2(-1.0, -1.0),
@@ -127,7 +175,6 @@ function initDebugDrawResources() {
     }
   `;
 
-  // 同时支持 texture-2d 和 texture-array，两者只用一个
   const fsSource = `#version 300 es
     precision highp float;
     precision highp sampler2D;
@@ -138,7 +185,7 @@ function initDebugDrawResources() {
 
     uniform sampler2D uTex2D;
     uniform sampler2DArray uTexArray;
-    uniform int uTextureType;   // 0 = 2D, 1 = array
+    uniform int uTextureType;
     uniform int uImageIndex;
 
     void main() {
@@ -156,6 +203,257 @@ function initDebugDrawResources() {
 
   debugProgram = createProgram(gl, vsSource, fsSource);
   debugVAO = gl.createVertexArray();
+}
+
+function initPanelResources() {
+  panelCanvas = document.createElement("canvas");
+  panelCanvas.width = 512;
+  panelCanvas.height = 384;
+  panelCtx = panelCanvas.getContext("2d");
+
+  const vsSource = `#version 300 es
+    precision highp float;
+
+    layout(location = 0) in vec2 aPosition;
+    layout(location = 1) in vec2 aUv;
+
+    uniform mat4 uMvp;
+    out vec2 vUv;
+
+    void main() {
+      vUv = aUv;
+      gl_Position = uMvp * vec4(aPosition, 0.0, 1.0);
+    }
+  `;
+
+  const fsSource = `#version 300 es
+    precision highp float;
+
+    in vec2 vUv;
+    uniform sampler2D uTexture;
+    out vec4 outColor;
+
+    void main() {
+      outColor = texture(uTexture, vUv);
+    }
+  `;
+
+  panelProgram = createProgram(gl, vsSource, fsSource);
+
+  const vertices = new Float32Array([
+    // x, y, u, v
+    -0.5, -0.5, 0, 1,
+     0.5, -0.5, 1, 1,
+    -0.5,  0.5, 0, 0,
+     0.5,  0.5, 1, 0,
+  ]);
+
+  panelVAO = gl.createVertexArray();
+  gl.bindVertexArray(panelVAO);
+
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+
+  gl.bindVertexArray(null);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+  panelTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, panelTexture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.RGBA,
+    panelCanvas.width,
+    panelCanvas.height,
+    0,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    null
+  );
+  gl.bindTexture(gl.TEXTURE_2D, null);
+
+  drawPlaceholderPanel();
+  uploadPanelTexture();
+}
+
+function drawPlaceholderPanel() {
+  const ctx = panelCtx;
+  ctx.clearRect(0, 0, panelCanvas.width, panelCanvas.height);
+
+  ctx.fillStyle = "rgba(20,20,20,0.85)";
+  ctx.fillRect(0, 0, panelCanvas.width, panelCanvas.height);
+
+  ctx.fillStyle = "white";
+  ctx.font = "bold 28px sans-serif";
+  ctx.fillText("Depth Heatmap", 24, 40);
+
+  ctx.font = "20px sans-serif";
+  ctx.fillText("Pinch to capture a snapshot", 24, 80);
+
+  panelTextureDirty = true;
+}
+
+function gray01ToColor(v) {
+  // 简单蓝->青->黄->红
+  const t = Math.max(0, Math.min(1, v));
+  const r = Math.floor(255 * Math.max(0, Math.min(1, 1.5 * t)));
+  const g = Math.floor(255 * Math.max(0, Math.min(1, 1.5 * (1 - Math.abs(t - 0.5) * 2))));
+  const b = Math.floor(255 * Math.max(0, Math.min(1, 1.5 * (1 - t))));
+  return `rgb(${r},${g},${b})`;
+}
+
+function buildGridMatrix(regionGridStats) {
+  const grid = [];
+  for (let r = 0; r < regionGridStats.rows; r++) {
+    const row = [];
+    for (let c = 0; c < regionGridStats.cols; c++) {
+      const item = regionGridStats.regions.find(x => x.row === r && x.col === c);
+      row.push(item ? item.meanGray01 : null);
+    }
+    grid.push(row);
+  }
+  return grid;
+}
+
+function updateHeatmapPanel(snapshot) {
+  if (!snapshot || !snapshot.regionGridStats) return;
+
+  const ctx = panelCtx;
+  const w = panelCanvas.width;
+  const h = panelCanvas.height;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "rgba(20,20,20,0.88)";
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.fillStyle = "white";
+  ctx.font = "bold 28px sans-serif";
+  ctx.fillText("Depth Heatmap", 20, 36);
+
+  ctx.font = "18px sans-serif";
+  ctx.fillText(`center mean: ${snapshot.centerRegionStats?.meanGray01?.toFixed(4) ?? "n/a"}`, 20, 66);
+  ctx.fillText(`depthUsage: ${snapshot.depthUsage ?? "n/a"}`, 20, 92);
+
+  const grid = buildGridMatrix(snapshot.regionGridStats);
+
+  const rows = grid.length;
+  const cols = grid[0].length;
+  const gridSize = 240;
+  const cellW = gridSize / cols;
+  const cellH = gridSize / rows;
+  const startX = 20;
+  const startY = 120;
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const v = grid[r][c];
+      ctx.fillStyle = v == null ? "rgb(80,80,80)" : gray01ToColor(v);
+      ctx.fillRect(startX + c * cellW, startY + r * cellH, cellW - 2, cellH - 2);
+
+      if (v != null) {
+        ctx.fillStyle = "black";
+        ctx.font = "14px sans-serif";
+        ctx.fillText(
+          v.toFixed(3),
+          startX + c * cellW + 8,
+          startY + r * cellH + cellH / 2
+        );
+      }
+    }
+  }
+
+  // 小图例
+  const legendX = 300;
+  const legendY = 130;
+  const legendW = 28;
+  const legendH = 180;
+  for (let i = 0; i < legendH; i++) {
+    const t = 1 - i / (legendH - 1);
+    ctx.fillStyle = gray01ToColor(t);
+    ctx.fillRect(legendX, legendY + i, legendW, 1);
+  }
+  ctx.strokeStyle = "white";
+  ctx.strokeRect(legendX, legendY, legendW, legendH);
+
+  ctx.fillStyle = "white";
+  ctx.font = "16px sans-serif";
+  ctx.fillText("near-ish", legendX + 40, legendY + legendH);
+  ctx.fillText("far-ish", legendX + 40, legendY + 12);
+
+  ctx.font = "16px sans-serif";
+  ctx.fillText(`window: ${snapshot.regionGridStats.cellWindowSize}x${snapshot.regionGridStats.cellWindowSize}`, 20, 345);
+  ctx.fillText(`spacing: ${snapshot.regionGridStats.spacingPixels}`, 220, 345);
+
+  panelTextureDirty = true;
+}
+
+function uploadPanelTexture() {
+  if (!panelTextureDirty || !panelTexture) return;
+
+  gl.bindTexture(gl.TEXTURE_2D, panelTexture);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.RGBA,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    panelCanvas
+  );
+  gl.bindTexture(gl.TEXTURE_2D, null);
+
+  panelTextureDirty = false;
+}
+
+function drawPanelInFrontOfView(view) {
+  if (!panelProgram || !panelTexture) return;
+
+  uploadPanelTexture();
+
+  const viewMatrix = new Float32Array(view.transform.inverse.matrix);
+  const projMatrix = new Float32Array(view.projectionMatrix);
+
+  const modelTranslate = makeTranslationMatrix(
+    PANEL_OFFSET_X,
+    PANEL_OFFSET_Y,
+    -PANEL_DISTANCE
+  );
+  const modelScale = makeScaleMatrix(PANEL_WIDTH, PANEL_HEIGHT, 1);
+  const modelMatrix = multiplyMat4(modelTranslate, modelScale);
+  const mv = multiplyMat4(viewMatrix, modelMatrix);
+  const mvp = multiplyMat4(projMatrix, mv);
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.disable(gl.DEPTH_TEST);
+
+  gl.useProgram(panelProgram);
+  gl.bindVertexArray(panelVAO);
+
+  const uMvp = gl.getUniformLocation(panelProgram, "uMvp");
+  const uTexture = gl.getUniformLocation(panelProgram, "uTexture");
+
+  gl.uniformMatrix4fv(uMvp, false, mvp);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, panelTexture);
+  gl.uniform1i(uTexture, 0);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  gl.bindVertexArray(null);
+  gl.useProgram(null);
 }
 
 function ensureDebugTarget(width, height) {
@@ -276,18 +574,11 @@ function readDebugColorPixels() {
 function getPixelRGBA(pixels, width, x, y) {
   const clampedX = Math.max(0, Math.min(width - 1, x));
   const clampedY = Math.max(0, Math.min(debugDepthHeight - 1, y));
-
   const idx = (clampedY * width + clampedX) * 4;
-  return [
-    pixels[idx],
-    pixels[idx + 1],
-    pixels[idx + 2],
-    pixels[idx + 3],
-  ];
+  return [pixels[idx], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3]];
 }
 
 function rgbaToGray01(rgba) {
-  // 这里你的 debug depth 是灰度写入，所以 rgb 相同，取 r 就够了
   return rgba[0] / 255;
 }
 
@@ -331,8 +622,8 @@ function computeGridStats(pixels, width, height, baseX, baseY) {
 
   for (let row = 0; row < GRID_ROWS; row++) {
     for (let col = 0; col < GRID_COLS; col++) {
-      const centerX = baseX + (col - colOffset) * GRID_SPACING;
-      const centerY = baseY + (row - rowOffset) * GRID_SPACING;
+      const centerX = Math.round(baseX + (col - colOffset) * GRID_SPACING);
+      const centerY = Math.round(baseY + (row - rowOffset) * GRID_SPACING);
 
       const stats = computeWindowStats(
         pixels,
@@ -361,6 +652,19 @@ function computeGridStats(pixels, width, height, baseX, baseY) {
   };
 }
 
+function downloadJSON(obj, filename = "snapshot-depth.json") {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], {
+    type: "application/json"
+  });
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 async function initAR() {
   if (!navigator.xr) {
     log("navigator.xr not available.");
@@ -385,6 +689,7 @@ async function initAR() {
   }
 
   initDebugDrawResources();
+  initPanelResources();
 
   xrSession = await navigator.xr.requestSession("immersive-ar", {
     requiredFeatures: ["local", "depth-sensing"],
@@ -419,8 +724,6 @@ async function initAR() {
 
   xrSession.updateRenderState({ baseLayer });
   xrRefSpace = await xrSession.requestReferenceSpace("local");
-
-  // GPU 路径
   xrGlBinding = new XRWebGLBinding(xrSession, gl);
 
   log("AR session started.");
@@ -438,9 +741,15 @@ function onXRFrame(time, frame) {
 
   const baseLayer = session.renderState.baseLayer;
   gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
-
   gl.clearColor(0.0, 0.0, 0.0, 0.0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  // 先渲染面板到每个 view
+  for (const view of pose.views) {
+    const viewport = baseLayer.getViewport(view);
+    gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+    drawPanelInFrontOfView(view);
+  }
 
   const view = pose.views[0];
   if (!view) return;
@@ -455,7 +764,6 @@ function onXRFrame(time, frame) {
     let depthInfo = null;
     let depthPath = "none";
 
-    // 先试 GPU 路径
     try {
       if (xrGlBinding) {
         depthInfo = xrGlBinding.getDepthInformation(view);
@@ -465,7 +773,6 @@ function onXRFrame(time, frame) {
       debugLogs.push(`gpu getDepthInformation failed: ${err.message}`);
     }
 
-    // 再退回 CPU 路径
     if (!depthInfo) {
       try {
         depthInfo = frame.getDepthInformation(view);
@@ -538,7 +845,6 @@ function onXRFrame(time, frame) {
           debugLogs.push(`gpu readback failed: ${err.message}`);
         }
       } else {
-        // CPU 路径可直接拿米
         try {
           const centerDepthMeters = depthInfo.getDepthInMeters(0.5, 0.5);
           rawCenterSample = {
@@ -575,10 +881,14 @@ function onXRFrame(time, frame) {
       notes: [
         "rawCenterSample.gray01 is not meters",
         "centerRegionStats is the mean/min/max of a center window",
-        "regionGridStats is a 3x3 grid around the center",
+        "regionGridStats is a 5x5 grid around the center",
         "these values are useful as relative depth cues"
       ],
     };
+
+    if (latestSnapshot.regionGridStats) {
+      updateHeatmapPanel(latestSnapshot);
+    }
 
     debugLogs.push("snapshot-depth.json download triggered.");
     debugLogs.push("----- SNAPSHOT END -----");
@@ -586,20 +896,6 @@ function onXRFrame(time, frame) {
     downloadJSON(latestSnapshot, "snapshot-depth.json");
     log("snapshot-depth.json download triggered.");
   }
-}
-
-function downloadJSON(obj, filename = "snapshot-depth.json") {
-  const blob = new Blob(
-    [JSON.stringify(obj, null, 2)],
-    { type: "application/json" }
-  );
-
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
 }
 
 enterArBtn.addEventListener("click", async () => {
